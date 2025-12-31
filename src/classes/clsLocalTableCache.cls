@@ -1,7 +1,8 @@
 ' ============================================================================
-' CLASS: clsLocalTableCache (Enhanced v2.0)
+' CLASS: clsLocalTableCache (Corrected v2.1)
 ' PURPOSE: Core cache engine with lazy loading and version control
 ' STRATEGY: Load on demand, respect configuration flags
+' FIXES: Transaction handling, refresh logic, initial table creation
 ' ============================================================================
 Option Compare Database
 Option Explicit
@@ -9,6 +10,33 @@ Option Explicit
 ' === Private State ===
 Private mMachineName As String
 Private mIsInitialized As Boolean
+
+' ============================================================================
+' TYPE DEFINITIONS
+' ============================================================================
+
+Private Type LookupConfig
+    LookupName As String
+    LocalTableName As String
+    AccessQuery As String
+    SQLServerQuery As String
+    RefreshOnStartup As Boolean
+    RefreshIntervalHours As Long
+    RefreshVersion As Long
+    TruncateBeforeLoad As Boolean
+    useTransaction As Boolean
+    DeleteOnShutdown As Boolean
+    LazyLoad As Boolean
+End Type
+
+Private Type ClientState
+    LookupName As String
+    LastRefreshVersion As Long
+    LastRefreshDate As Date
+    LastRecordCount As Long
+    LastRefreshStatus As String
+    LastErrorMessage As String
+End Type
 
 ' ============================================================================
 ' INITIALIZATION
@@ -47,8 +75,8 @@ Public Sub LoadStartupTables()
     Dim failedCount As Long
     
     sql = "SELECT LookupName FROM APP_LookupConfig " & _
-          "WHERE IsActive=True AND IsStatic=True AND RefreshOnStartup=True " & _
-          "ORDER BY LoadOrder"
+      "WHERE IsActive=True AND IsStatic=True " & _
+      "ORDER BY LoadOrder"
     
     Set rs = CurrentDb.OpenRecordset(sql)
     
@@ -63,10 +91,10 @@ Public Sub LoadStartupTables()
     Do Until rs.EOF
         If EnsureTableReady(rs!LookupName) Then
             loadedCount = loadedCount + 1
-            Debug.Print "Cache>   ✓ " & rs!LookupName
+            Debug.Print "Cache>   ? " & rs!LookupName
         Else
             failedCount = failedCount + 1
-            Debug.Print "Cache>   ✗ " & rs!LookupName & " (failed)"
+            Debug.Print "Cache>   ? " & rs!LookupName & " (failed)"
         End If
         rs.MoveNext
     Loop
@@ -98,18 +126,21 @@ Public Function EnsureTableReady(LookupName As String) As Boolean
     
     ' Step 1: Ensure table structure exists
     If Not TableExists(cfg.LocalTableName) Then
+        Debug.Print "Cache> Table does not exist, creating: " & cfg.LocalTableName
         If Not CreateLocalTable(cfg) Then
             Debug.Print "Cache> Failed to create table: " & cfg.LocalTableName
             Exit Function
         End If
     End If
     
-    ' Step 2: Check if refresh needed
+    ' Step 2: Check if refresh/initial load needed
     If IsRefreshNeeded(cfg) Then
         If Not RefreshTableData(cfg) Then
             Debug.Print "Cache> Failed to refresh: " & LookupName
             Exit Function
         End If
+    Else
+        Debug.Print "Cache> Table ready (no refresh needed): " & LookupName
     End If
     
     EnsureTableReady = True
@@ -129,17 +160,20 @@ Public Function ForceRefresh(LookupName As String) As Boolean
     Dim cfg As LookupConfig
     
     If Not GetConfig(LookupName, cfg) Then
+        Debug.Print "Cache> Config not found for force refresh: " & LookupName
         Exit Function
     End If
     
     ' Ensure table exists first
     If Not TableExists(cfg.LocalTableName) Then
+        Debug.Print "Cache> Creating table for force refresh: " & cfg.LocalTableName
         If Not CreateLocalTable(cfg) Then
             Exit Function
         End If
     End If
     
-    ' Force refresh
+    ' Force refresh regardless of version/time
+    Debug.Print "Cache> Force refreshing: " & LookupName
     ForceRefresh = RefreshTableData(cfg)
     
     Exit Function
@@ -155,117 +189,160 @@ End Function
 
 ' -----------------------------------------------------------------------
 ' IsRefreshNeeded - Determines if table needs refreshing
+' FIXED: Properly handles initial load, version changes, and time-based refresh
 ' -----------------------------------------------------------------------
 Private Function IsRefreshNeeded(cfg As LookupConfig) As Boolean
     On Error Resume Next
     
-    Dim clientState As ClientState
+    Dim ClientState As ClientState
     
     ' Get client state
-    If Not GetClientState(cfg.LookupName, clientState) Then
-        ' No state = needs refresh
+    If Not GetClientState(cfg.LookupName, ClientState) Then
+        ' No state = needs initial load
+        Debug.Print "Cache> Initial load needed: " & cfg.LookupName & " (no client state)"
         IsRefreshNeeded = True
         Exit Function
     End If
     
-    ' Check 1: Version mismatch
-    If cfg.RefreshVersion > clientState.LastRefreshVersion Then
+    ' Check 1: Empty table (no data loaded yet)
+    If ClientState.LastRecordCount = 0 And ClientState.LastRefreshStatus <> "Success" Then
+        Debug.Print "Cache> Empty table, load needed: " & cfg.LookupName
+        IsRefreshNeeded = True
+        Exit Function
+    End If
+    
+    ' Check 2: Version mismatch (config version is higher)
+    If cfg.RefreshVersion > ClientState.LastRefreshVersion Then
         Debug.Print "Cache> Version refresh needed: " & cfg.LookupName & _
-                    " (Config: " & cfg.RefreshVersion & ", Client: " & clientState.LastRefreshVersion & ")"
+                    " (Config v" & cfg.RefreshVersion & " > Client v" & ClientState.LastRefreshVersion & ")"
         IsRefreshNeeded = True
         Exit Function
     End If
     
-    ' Check 2: Time-based refresh
+    ' Check 3: Time-based refresh
     If cfg.RefreshIntervalHours > 0 Then
-        If IsNull(clientState.LastRefreshDate) Then
+        If IsNull(ClientState.LastRefreshDate) Or ClientState.LastRefreshDate = #1/1/1900# Then
+            Debug.Print "Cache> No refresh date, load needed: " & cfg.LookupName
             IsRefreshNeeded = True
             Exit Function
         End If
         
         Dim hoursSinceRefresh As Long
-        hoursSinceRefresh = DateDiff("h", clientState.LastRefreshDate, Now())
+        hoursSinceRefresh = DateDiff("h", ClientState.LastRefreshDate, Now())
         
         If hoursSinceRefresh >= cfg.RefreshIntervalHours Then
             Debug.Print "Cache> Time-based refresh needed: " & cfg.LookupName & _
-                        " (" & hoursSinceRefresh & " hours elapsed)"
+                        " (" & hoursSinceRefresh & " hours elapsed, interval: " & cfg.RefreshIntervalHours & "h)"
             IsRefreshNeeded = True
             Exit Function
         End If
     End If
     
-    ' Check 3: Failed last refresh
-    If clientState.LastRefreshStatus = "Failed" Then
-        Debug.Print "Cache> Retry after failure: " & cfg.LookupName
+    ' Check 4: Failed last refresh (retry)
+    If ClientState.LastRefreshStatus = "Failed" _
+       Or ClientState.LastRefreshStatus = "Pending" _
+       Or ClientState.LastRefreshStatus = "Error" Then
+    
+        Debug.Print "Cache> Retry after failed/pending/error state: " & cfg.LookupName
         IsRefreshNeeded = True
         Exit Function
     End If
     
+    ' All checks passed - no refresh needed
     IsRefreshNeeded = False
 End Function
 
 ' -----------------------------------------------------------------------
 ' RefreshTableData - Loads data from source into local table
+' FIXED: Proper DAO transaction handling using DBEngine.Workspaces
 ' -----------------------------------------------------------------------
 Private Function RefreshTableData(cfg As LookupConfig) As Boolean
     On Error GoTo ErrHandler
-    
+
     Dim startTime As Double
     Dim recordsLoaded As Long
     Dim sourceQuery As String
-    
+    Dim ws As DAO.Workspace
+    Dim useTransaction As Boolean
+    Dim db As DAO.Database
+
+    Set db = CurrentDb
     startTime = Timer
-    
+
     ' Get appropriate query
     sourceQuery = GetSourceQuery(cfg)
     If sourceQuery = "" Then
         UpdateClientState cfg.LookupName, False, 0, 0, "No source query defined"
         Exit Function
     End If
-    
+
     Debug.Print "Cache> Refreshing: " & cfg.LookupName
-    
-    ' Use transaction if configured
-    If cfg.UseTransaction Then
-        CurrentDb.Execute "BEGIN TRANSACTION", dbFailOnError
+
+    ' Start transaction if configured
+    useTransaction = cfg.useTransaction
+    If useTransaction Then
+        On Error Resume Next
+        Set ws = DBEngine.Workspaces(0)
+        If Err.Number = 0 Then
+            ws.BeginTrans
+            Debug.Print "Cache>   Transaction started"
+        Else
+            Debug.Print "Cache>   WARNING: Transaction not available, proceeding without"
+            useTransaction = False
+            Err.Clear
+        End If
+        On Error GoTo ErrHandler
     End If
-    
+
     On Error GoTo TransactionError
-    
+
     ' Truncate if configured
     If cfg.TruncateBeforeLoad Then
-        CurrentDb.Execute "DELETE FROM [" & cfg.LocalTableName & "]", dbFailOnError
+        db.Execute "DELETE FROM [" & cfg.LocalTableName & "]", dbFailOnError
+        Debug.Print "Cache>   Table truncated"
     End If
-    
+
     ' Load data
-    CurrentDb.Execute "INSERT INTO [" & cfg.LocalTableName & "] " & sourceQuery, dbFailOnError
-    
-    ' Count records
-    recordsLoaded = DCount("*", cfg.LocalTableName)
-    
+    db.Execute "INSERT INTO [" & cfg.LocalTableName & "] " & sourceQuery, dbFailOnError
+
+    ' SAFE record count (prevents error 3008)
+    recordsLoaded = db.recordsAffected
+
     ' Commit transaction
-    If cfg.UseTransaction Then
-        CurrentDb.Execute "COMMIT TRANSACTION", dbFailOnError
+    If useTransaction Then
+        ws.CommitTrans
+        Debug.Print "Cache>   Transaction committed"
     End If
-    
+
+    ' Calculate duration
+    Dim Duration As Long
+    Duration = CLng((Timer - startTime) * 1000) ' milliseconds
+
     ' Update state
-    Dim duration As Long
-    duration = CLng((Timer - startTime) * 1000) ' milliseconds
-    
-    UpdateClientState cfg.LookupName, True, cfg.RefreshVersion, recordsLoaded, "", duration
-    
-    Debug.Print "Cache>   ✓ Loaded " & recordsLoaded & " records in " & duration & "ms"
-    
+    UpdateClientState cfg.LookupName, True, cfg.RefreshVersion, recordsLoaded, "", Duration
+
+    Debug.Print "Cache>   ? Loaded " & recordsLoaded & " records in " & Duration & "ms"
+
     RefreshTableData = True
     Exit Function
-    
+
 TransactionError:
-    If cfg.UseTransaction Then
+    If useTransaction Then
         On Error Resume Next
-        CurrentDb.Execute "ROLLBACK TRANSACTION", dbFailOnError
+        If Not ws Is Nothing Then
+            ws.Rollback
+            Debug.Print "Cache>   Transaction rolled back"
+        End If
+        On Error GoTo 0
     End If
-    
+
 ErrHandler:
+    If useTransaction Then
+        On Error Resume Next
+        If Not ws Is Nothing Then ws.Rollback
+        On Error GoTo 0
+    End If
+
     UpdateClientState cfg.LookupName, False, 0, 0, Err.Description
     Debug.Print "Cache> ERROR refreshing " & cfg.LookupName & ": " & Err.Description
     RefreshTableData = False
@@ -288,19 +365,20 @@ Private Function CreateLocalTable(cfg As LookupConfig) As Boolean
         Err.Raise vbObjectError + 1001, , "No schema query for " & cfg.LookupName
     End If
     
-    ' Remove trailing semicolon
+    ' Remove trailing semicolon if present
     If Right(schemaQuery, 1) = ";" Then
         schemaQuery = Left(schemaQuery, Len(schemaQuery) - 1)
     End If
     
-    ' Create empty table with schema
-    Debug.Print "Cache> Creating table: " & cfg.LocalTableName
+    ' Create empty table with schema (SELECT INTO with WHERE 1=0)
+    Debug.Print "Cache> Creating table structure: " & cfg.LocalTableName
     
     CurrentDb.Execute _
         "SELECT * INTO [" & cfg.LocalTableName & "] " & _
         "FROM (" & schemaQuery & ") AS SourceData WHERE 1=0", _
         dbFailOnError
     
+    Debug.Print "Cache>   ? Table created: " & cfg.LocalTableName
     CreateLocalTable = True
     Exit Function
     
@@ -328,7 +406,7 @@ Private Sub UpdateClientState( _
     
     Dim sql As String
     
-    ' Delete existing state
+    ' Delete existing state for this machine
     sql = "DELETE FROM APP_LookupClientState " & _
           "WHERE LookupName='" & SQLSafe(LookupName) & "' " & _
           "AND ClientMachineName='" & SQLSafe(mMachineName) & "'"
@@ -423,7 +501,7 @@ Private Function GetConfig(LookupName As String, ByRef cfg As LookupConfig) As B
         .RefreshIntervalHours = Nz(rs!RefreshIntervalHours, 0)
         .RefreshVersion = Nz(rs!RefreshVersion, 1)
         .TruncateBeforeLoad = Nz(rs!TruncateBeforeLoad, True)
-        .UseTransaction = Nz(rs!UseTransaction, True)
+        .useTransaction = Nz(rs!useTransaction, True)
         .DeleteOnShutdown = Nz(rs!DeleteOnShutdown, False)
         .LazyLoad = Nz(rs!LazyLoad, True)
     End With
@@ -438,6 +516,7 @@ End Function
 Private Function GetSourceQuery(cfg As LookupConfig) As String
     If gBackendType = Backend_SQLServer Then
         GetSourceQuery = cfg.SQLServerQuery
+        If GetSourceQuery = "" Then GetSourceQuery = cfg.AccessQuery ' Fallback
     Else
         GetSourceQuery = cfg.AccessQuery
     End If
@@ -449,6 +528,7 @@ End Function
 
 ' -----------------------------------------------------------------------
 ' CleanupOnShutdown - Deletes tables marked for deletion
+' PROPERLY respects DeleteOnShutdown flag
 ' -----------------------------------------------------------------------
 Public Function CleanupOnShutdown() As Long
     On Error Resume Next
@@ -464,6 +544,7 @@ Public Function CleanupOnShutdown() As Long
     
     If rs.EOF And rs.BOF Then
         rs.Close
+        Debug.Print "Cache> No tables marked for deletion"
         CleanupOnShutdown = 0
         Exit Function
     End If
@@ -475,9 +556,9 @@ Public Function CleanupOnShutdown() As Long
             CurrentDb.TableDefs.Delete rs!LocalTableName
             If Err.Number = 0 Then
                 deleteCount = deleteCount + 1
-                Debug.Print "Cache>   ✓ Deleted: " & rs!LocalTableName
+                Debug.Print "Cache>   ? Deleted: " & rs!LocalTableName
             Else
-                Debug.Print "Cache>   ✗ Failed to delete: " & rs!LocalTableName
+                Debug.Print "Cache>   ? Failed to delete: " & rs!LocalTableName & " (" & Err.Description & ")"
                 Err.Clear
             End If
         End If
@@ -497,35 +578,9 @@ Private Function TableExists(tableName As String) As Boolean
     Dim tdf As DAO.TableDef
     Set tdf = CurrentDb.TableDefs(tableName)
     TableExists = (Err.Number = 0)
+    Err.Clear
 End Function
 
 Private Function SQLSafe(Value As String) As String
     SQLSafe = Replace(Value, "'", "''")
 End Function
-
-' ============================================================================
-' TYPE DEFINITIONS
-' ============================================================================
-
-Private Type LookupConfig
-    LookupName As String
-    LocalTableName As String
-    AccessQuery As String
-    SQLServerQuery As String
-    RefreshOnStartup As Boolean
-    RefreshIntervalHours As Long
-    RefreshVersion As Long
-    TruncateBeforeLoad As Boolean
-    UseTransaction As Boolean
-    DeleteOnShutdown As Boolean
-    LazyLoad As Boolean
-End Type
-
-Private Type ClientState
-    LookupName As String
-    LastRefreshVersion As Long
-    LastRefreshDate As Date
-    LastRecordCount As Long
-    LastRefreshStatus As String
-    LastErrorMessage As String
-End Type
