@@ -1,0 +1,36 @@
+# Access database files  
+*.accdb  
+*.mdb  
+# Access temporary files  
+~$*.accdb  
+~$*.mdb  
+*.tmp  
+*.temp  
+*.ft!  
+*.log  
+# Windows files  
+Thumbs.db  
+ehthumbs.db  
+Icon?  
+.DS_Store  
+*.lnk  
+# Backup files  
+*.bak  
+*.old  
+*.orig  
+*.backup  
+# IDE files  
+.vs/  
+.idea/  
+*.swp  
+*.swo  
+.DS_Store  
+# User-specific files  
+*.user  
+*.useros  
+*.userprefs  
+# Temporary build outputs  
+obj/  
+bin/  
+Debug/  
+Release/ 
